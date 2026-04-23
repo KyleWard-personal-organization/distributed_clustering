@@ -1,7 +1,8 @@
 # Compiled Data
 data/
 *.csv
-*.png
+#*.png
+*.parquet 
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
