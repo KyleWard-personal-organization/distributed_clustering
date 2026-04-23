@@ -41,10 +41,20 @@ def save_data(data: np.ndarray, filepath: str):
 if __name__ == "__main__":
     data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
     
-    # 生成小规模测试数据
+    # 1k data
+    data_1k = generate_variable_density_data(n_samples=1000)
+    save_data(data_1k, os.path.join(data_dir, "test_data_1k.csv"))
+
+    #生成小规模测试数据
     small_data = generate_variable_density_data(n_samples=2000)
     save_data(small_data, os.path.join(data_dir, "test_data_2k.csv"))
+
+    # 5k data
+    data_5k = generate_variable_density_data(n_samples=5000)
+    save_data(data_5k, os.path.join(data_dir, "test_data_5k.csv"))
     
-    # 生成中等规模数据用于 Scalability 测试
+    #生成中等规模数据用于 Scalability 测试
     med_data = generate_variable_density_data(n_samples=10000)
     save_data(med_data, os.path.join(data_dir, "test_data_10k.csv"))
+
+

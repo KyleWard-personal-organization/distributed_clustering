@@ -66,7 +66,13 @@ def main():
     # 保证顺序一致
     df['cluster'] = [labels_dict.get(i, "NOISE") for i in range(len(df))]
     
-    out_path = args.data.replace(".csv", f"_{args.algo}_results.csv")
+    # 将 eps 编入文件名，避免多次实验互相覆盖
+    if args.algo == "dbscan":
+        param_tag = f"eps{args.eps}"
+    else:
+        param_tag = ""
+    suffix = f"_{param_tag}" if param_tag else ""
+    out_path = args.data.replace(".csv", f"_{args.algo}_results{suffix}.csv")
     df.to_csv(out_path, index=False)
     print(f"Results saved to {out_path}")
     
