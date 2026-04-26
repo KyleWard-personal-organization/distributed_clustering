@@ -336,7 +336,7 @@ def main():
                     help="Original CSV (x, y columns). Used to resolve result file prefix "
                          "and for sklearn fallback.")
     ap.add_argument("--mode", choices=["sweep", "map"], default="sweep")
-    ap.add_argument("--out", type=Path, default=_PROJECT_ROOT / "data")
+    ap.add_argument("--out", type=Path, default=_PROJECT_ROOT / "imgs")
 
     # Explicit result files (override auto-discovery)
     ap.add_argument("--dbscan-files", type=Path, nargs="*", default=None,

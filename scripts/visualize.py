@@ -4,6 +4,8 @@ import seaborn as sns
 import argparse
 import os
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 def visualize_clusters(filepath, title):
     df = pd.read_csv(filepath)
     
@@ -36,7 +38,9 @@ def visualize_clusters(filepath, title):
         
     plt.tight_layout()
     
-    out_path = filepath.replace(".csv", ".png")
+    out_dir = os.path.join(PROJECT_ROOT, "imgs")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, os.path.basename(filepath).replace(".csv", ".png"))
     plt.savefig(out_path, dpi=300)
     print(f"Plot saved to {out_path}")
     plt.close()

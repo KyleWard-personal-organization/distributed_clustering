@@ -8,13 +8,30 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
+import os, sys
+import re
+
+
+# 自动将项目根目录添加到 sys.path 中，避免手动 export PYTHONPATH
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 
 # ── 实验数据（从控制台日志提取）────────────────────────────────────────────────
+processor_name = "Intel Core i7"
 cores = [1, 2, 4]
 
+# i7 data
 phase1 = [9.4157,   6.3747,   4.4397]   # _spatial_partitioning
 phase2 = [202.6561, 130.7947, 120.7852] # _build_local_mst
 phase3 = [118.8170, 119.9011, 126.7119] # _merge_global_mst
+
+# M1 data
+# phase1 = [28.8406,  15.7653,   9.2194]   # _spatial_partitioning
+# phase2 = [94.2808,  51.9486,  48.3827] # _build_local_mst
+# phase3 = [45.2292,  44.4981,  52.8582] # _merge_global_mst
 
 total  = [p1 + p2 + p3 for p1, p2, p3 in zip(phase1, phase2, phase3)]
 # Speedup = T1 / Tn
@@ -36,6 +53,8 @@ bar_width = 0.45
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
 fig.patch.set_facecolor('#F8F9FA')
+fig.suptitle(f'Experiment 2: Strong Scaling  |  Processor: {processor_name}',
+             fontsize=14, fontweight='bold', y=1.02)
 for ax in (ax1, ax2):
     ax.set_facecolor('#FFFFFF')
 
@@ -43,11 +62,11 @@ for ax in (ax1, ax2):
 b1 = ax1.bar(x, phase1, bar_width, label='Phase 1: Spatial Partitioning',
              color=COLORS['phase1'], edgecolor='white', linewidth=0.8)
 b2 = ax1.bar(x, phase2, bar_width, bottom=phase1,
-             label='Phase 2: Build Local MSTs (Parallel)',
+             label='Phase 2: Build Local MSTs',
              color=COLORS['phase2'], edgecolor='white', linewidth=0.8)
 b3 = ax1.bar(x, phase3, bar_width,
              bottom=[p1 + p2 for p1, p2 in zip(phase1, phase2)],
-             label='Phase 3: Merge Global MST (Serial)',
+             label='Phase 3: Merge Global MST',
              color=COLORS['phase3'], edgecolor='white', linewidth=0.8)
 
 # 在每段中间标注数值
@@ -94,22 +113,11 @@ for c, sp in zip(cores, speedup):
                  xytext=(8, 6), textcoords='offset points',
                  fontsize=9.5, color=COLORS['speedup'], fontweight='bold')
 
-# Amdahl's Law 注解框
-ax2.annotate(
-    "Phase 3 (serial bottleneck)\nremains ~120s regardless of cores\n→ Amdahl's Law",
-    xy=(4, speedup[2]),
-    xytext=(2.3, 2.5),
-    fontsize=8.5,
-    color=COLORS['phase3'],
-    arrowprops=dict(arrowstyle='->', color=COLORS['phase3'], lw=1.4),
-    bbox=dict(boxstyle='round,pad=0.4', facecolor='#FFF0F0', edgecolor=COLORS['phase3'], alpha=0.9)
-)
-
 ax2.set_xticks(cores)
 ax2.set_xticklabels([f'{c}' for c in cores], fontsize=11)
 ax2.set_xlabel('Number of Cores', fontsize=12)
 ax2.set_ylabel('Speedup  ($T_1 / T_n$)', fontsize=12)
-ax2.set_title('Strong Scaling: Speedup Curve\n(Amdahl\'s Law Analysis)', fontsize=13, fontweight='bold', pad=12)
+ax2.set_title('Strong Scaling: Speedup Curve\n(Actual vs Ideal)', fontsize=13, fontweight='bold', pad=12)
 ax2.legend(loc='upper left', fontsize=9.5, framealpha=0.9)
 ax2.set_xlim(0.5, 4.5)
 ax2.set_ylim(0, max(ideal_speedup) * 1.25)
@@ -118,14 +126,12 @@ ax2.grid(linestyle='--', alpha=0.4)
 ax2.spines['top'].set_visible(False)
 ax2.spines['right'].set_visible(False)
 
-# ── 底部注释 ────────────────────────────────────────────────────────────────
-fig.text(0.5, 0.01,
-         'Phase 2 (local MST build) scales well with cores — Embarrassingly Parallel.  '
-         'Phase 3 (global MST merge at Driver) stays constant — Serial Bottleneck.',
-         ha='center', fontsize=9, color='#555555',
-         style='italic')
+plt.tight_layout()
+out_dir = os.path.join(project_root, 'imgs')
+os.makedirs(out_dir, exist_ok=True)
 
-plt.tight_layout(rect=[0, 0.04, 1, 1])
-out_path = 'data/experiment2_strong_scaling.png'
+processor_suffix = re.sub(r'[^A-Za-z0-9]+', '_', processor_name).strip('_').lower()
+out_file_name = f'experiment2_strong_scaling_{processor_suffix}.png'
+out_path = os.path.join(out_dir, out_file_name)
 plt.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
 print(f'Saved → {out_path}')
