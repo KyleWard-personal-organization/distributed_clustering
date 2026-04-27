@@ -1,451 +1,136 @@
-# Proposal
+# Deep Project Proposal: 分布式 HDBSCAN 聚类算法的 Spark 实现
 
-## 1. Project Title
+## 1. 项目名称
 
-**Distributed DBSCAN Clustering with Apache Spark**
+**Distributed HDBSCAN Clustering with Apache Spark** (基于 Apache Spark 的分布式 HDBSCAN 聚类实现)
 
-## 2. Description of the Problem
+## 2. 项目背景与简介 (Introduction)
 
-### 2.1 Background
+聚类是数据挖掘中无监督学习的核心任务。传统的 DBSCAN (Density-Based Spatial Clustering of Applications with Noise) 算法因其无需预设簇数量、能发现任意形状的簇以及识别噪声的能力，被广泛应用。然而，DBSCAN 存在一个致命的缺陷：**它对全局单一的距离阈值（`eps`）极其敏感，无法有效处理具有不同密度的聚类结构。** 
 
-Clustering is a fundamental task in data mining and machine learning. Its goal is to group similar data points together while separating dissimilar ones. Among many clustering algorithms, **DBSCAN** (Density-Based Spatial Clustering of Applications with Noise) is especially attractive because it has several useful properties:
+为了解决这一问题，**HDBSCAN (Hierarchical DBSCAN)** 被提出。HDBSCAN 将 DBSCAN 转化为层次聚类算法，并通过提取稳定性最高的簇来自动适应不同的密度分布。它不仅保留了 DBSCAN 的所有优点，还彻底消除了对 `eps` 参数的依赖，在实际应用中表现出碾压级的优势。
 
-- it does not require the number of clusters to be specified in advance;
-- it can discover clusters of arbitrary shape;
-- it can explicitly identify noise and outliers.
+然而，HDBSCAN 的单机计算复杂度极高。它需要全局计算 $k$ 近邻来获取核心距离（Core Distance），计算任意两点间的互达距离（Mutual Reachability Distance, MRD），并在此基础上构建完全图的最小生成树（Minimum Spanning Tree, MST）。当数据量达到百万级别时，单机的内存和计算时间将成为不可逾越的瓶颈。
 
-These properties make DBSCAN suitable for many real-world applications such as spatial data analysis, anomaly detection, trajectory mining, and image or embedding-based clustering.
-
-However, despite its usefulness, DBSCAN is difficult to scale to large datasets. The main computational bottleneck comes from **neighborhood queries**: for each point, the algorithm needs to determine which other points lie within a distance threshold `eps`. In a naive implementation, this may require comparing each point with all other points, resulting in quadratic time complexity. Even with indexing structures, the algorithm remains challenging when the dataset becomes large.
-
-### 2.2 Why Distributed DBSCAN?
-
-A sequential DBSCAN implementation works well on a single machine for moderate data sizes, but it becomes inefficient or even infeasible when:
-
-- the dataset is too large to fit comfortably in memory,
-- neighborhood searches become expensive,
-- cluster expansion needs to be repeated over many points.
-
-Therefore, there is strong motivation to implement DBSCAN in a **distributed computing framework** such as Spark.
-
-Spark is suitable for this task because it supports:
-
-- data partitioning across workers,
-- parallel execution of map/reduce style transformations,
-- iterative computations,
-- in-memory processing for better performance than pure disk-based MapReduce.
-
-### 2.3 Main Challenge
-
-The main difficulty is that **DBSCAN is not naturally parallel**.
-
-Unlike algorithms such as K-means, DBSCAN relies on local density connectivity, which creates several challenges in a distributed setting:
-
-1. **Neighborhood search across partitions**
-   A point’s neighbors may lie in another partition, not only in its local partition.
-2. **Boundary handling**
-   Clusters may cross partition boundaries. If each partition is processed independently, one global cluster may be incorrectly split into several local clusters.
-3. **Cluster merging**
-   After local clustering, clusters found in different partitions must be merged correctly if they are density-connected through shared or boundary points.
-
-Because of these issues, implementing DBSCAN in Spark is not a matter of simply calling the standard algorithm inside each worker. A proper distributed design is required.
-
-### 2.4 Problem Statement
-
-This project aims to design and implement a **distributed version of DBSCAN in PySpark**, without relying on built-in clustering libraries, in accordance with the course requirement that the internal algorithmic logic must be implemented manually rather than delegated to a library.
-
-The project will focus on the following problem:
-
-> Given a large set of multidimensional data points, design a Spark-based distributed DBSCAN algorithm that can:
->
-> - perform clustering in parallel,
-> - preserve the semantics of density-based clustering,
-> - handle clusters spanning multiple partitions,
-> - identify noise points,
-> - and demonstrate scalability as data size and computational resources increase.
-
-## 3. Description of the Algorithm
-
-### 3.1 Standard DBSCAN Overview
-
-DBSCAN relies on two parameters:
-
-- `eps`: the radius of the neighborhood around a point;
-- `minPts`: the minimum number of points required to form a dense region.
-
-For each point `p`, we define its `eps`-neighborhood as all points within distance `eps` from `p`.
-
-A point is classified as:
-
-- **Core point**: if its `eps`-neighborhood contains at least `minPts` points;
-- **Border point**: if it is not a core point but lies within the neighborhood of a core point;
-- **Noise point**: if it is neither core nor border.
-
-Clusters are formed by connecting core points that are density-reachable, and attaching border points to nearby core-based clusters.
-
-### 3.2 Sequential DBSCAN Procedure
-
-The standard sequential procedure is:
-
-1. Mark all points as unvisited.
-2. For each unvisited point `p`:
-   - find all neighbors of `p` within distance `eps`;
-   - if the number of neighbors is less than `minPts`, mark `p` as noise temporarily;
-   - otherwise, create a new cluster and recursively expand it by visiting all density-reachable neighbors.
-3. Continue until all points are processed.
-
-### 3.3 Why Sequential DBSCAN is Hard to Parallelize
-
-The expensive and difficult part is not only the neighborhood query itself, but also the recursive cluster expansion. Once a point is found to be a core point, its neighbors must be explored, then neighbors of those neighbors, and so on. This creates a connected-component style dependency that may cross partition boundaries.
-
-Therefore, a distributed design must solve two problems simultaneously:
-
-- how to **parallelize local clustering work**,
-- how to **reconstruct global clusters** after local work is finished.
-
-### 3.4 Proposed Distributed DBSCAN Strategy
-
-This project proposes a **partition-based distributed DBSCAN** with three main phases:
-
-1. **Spatial partitioning of the dataset**
-2. **Local DBSCAN within each partition**
-3. **Global merging of boundary-connected local clusters**
-
-The design is intentionally practical and course-project oriented: it preserves the spirit of DBSCAN while keeping the implementation manageable in Spark.
-
-------
-
-#### Phase 1: Spatial Partitioning
-
-The dataset will first be partitioned according to spatial location.
-
-For low-dimensional numerical data (especially 2D or moderate dimensions), the feature space can be divided into **grid cells**. Each point is assigned to one primary cell based on its coordinates.
-
-The purpose of spatial partitioning is:
-
-- to reduce the search space for local neighborhood queries;
-- to ensure points that are close in space are likely to be processed together;
-- to make the algorithm parallelizable.
-
-However, a point near the edge of a cell may have neighbors in adjacent cells. Therefore, naive partitioning would break the correctness of DBSCAN.
-
-To address this, the project will use **boundary replication**:
-
-- if a point lies within distance `eps` from a cell boundary, it is replicated into neighboring cells that may contain its neighbors.
-
-This ensures that local clustering inside a partition has enough information to correctly identify dense connectivity near partition boundaries.
-
-##### Key idea:
-
-A point may appear in multiple partitions, but only one copy is its primary ownership record. Replicated copies are used only to support correct local clustering and later merging.
-
-------
-
-#### Phase 2: Local DBSCAN in Each Partition
-
-After partitioning and replication, each Spark partition (or cell group) will independently run a **local DBSCAN** on the set of points assigned to it.
-
-Inside one partition:
-
-- distances are computed only among points within that partition’s local dataset;
-- core/border/noise classification is determined locally;
-- local cluster identifiers are generated, for example as `(partition_id, local_cluster_id)`.
-
-This phase is embarrassingly parallel once partition contents are prepared.
-
-The output of local DBSCAN for each point will include:
-
-- point ID,
-- coordinates,
-- partition ID,
-- local cluster ID,
-- point type (core, border, noise),
-- whether the point is replicated or primary.
-
-At this stage, the same global cluster may still appear as multiple local clusters in different partitions.
-
-------
-
-#### Phase 3: Merging Local Clusters Across Partitions
-
-The final phase merges local clusters that should belong to the same global cluster.
-
-Two local clusters should be merged if they are connected through shared or boundary points. In practice, this can be detected using replicated points:
-
-- if the same original point appears in multiple partitions and is assigned to different local clusters,
-- or if two local clusters contain points that are within `eps` across a boundary,
-
-then these local clusters represent the same global DBSCAN cluster and should be merged.
-
-This merging can be formulated as a graph problem:
-
-- each local cluster is treated as a node;
-- an edge is added between two local clusters if they should be connected;
-- connected components of this graph represent final global clusters.
-
-A simple and effective way to implement this is to use **Union-Find (Disjoint Set Union)** or an equivalent connected-components merging logic.
-
-This phase is critical because it restores the global density connectivity that was temporarily broken by partitioning.
-
-------
-
-### 3.5 High-Level Pseudocode
-
-Below is the verbal pseudocode of the proposed algorithm:
-
-```text
-Input:
-    Dataset D
-    Distance threshold eps
-    Density threshold minPts
-
-Output:
-    Cluster label for each point
-
-1. Partition the data space into grid cells.
-2. For each point p in D:
-       assign p to its primary cell;
-       if p is within eps of a cell boundary,
-           replicate p to neighboring relevant cells.
-3. Group points by partition/cell.
-4. In parallel, for each partition:
-       run local DBSCAN on points in that partition;
-       assign local cluster IDs.
-5. Collect boundary/replicated point information.
-6. Determine which local clusters across partitions should be merged.
-7. Build a cluster-merge graph or Union-Find structure.
-8. Compute connected components of local clusters.
-9. Map each local cluster ID to a final global cluster ID.
-10. Output final labels for all original points.
-```
-
-------
-
-### 3.6 Expected Advantages of This Design
-
-This design has several advantages:
-
-1. **Parallel local work**
-   Most clustering work is done independently inside partitions.
-2. **Reduced search space**
-   Neighborhood queries are restricted to partition-local data plus replicated boundary points.
-3. **Correct boundary handling**
-   Replication prevents many cross-partition neighbor relationships from being missed.
-4. **Clear decomposition into Spark-friendly steps**
-   The algorithm naturally maps to transformations such as `map`, `flatMap`, `groupByKey`/`reduceByKey`, and post-processing for merging.
-
-------
-
-### 3.7 Limitations and Trade-offs
-
-This design also introduces trade-offs:
-
-1. **Replication overhead**
-   Boundary replication increases memory and communication cost.
-2. **Partition quality matters**
-   If partitions are poorly chosen, some cells may be overloaded while others remain sparse.
-3. **High-dimensional data is harder**
-   Grid partitioning becomes less efficient as dimensionality increases.
-4. **Merging complexity**
-   The correctness of the final result depends on accurate merge detection.
-
-These limitations are acceptable for a course project and also provide useful opportunities for analysis and discussion in the final report.
-
-------
-
-## 4. Brief Plan for Spark Implementation
-
-### 4.1 Implementation Language and Platform
-
-The project will use **PySpark**, since it satisfies the course requirement of implementing the algorithm with Spark’s Python API.
-
-The implementation will run in Spark local mode during development, and can be evaluated with different numbers of local worker threads to simulate varying parallel resources.
-
-### 4.2 Data Representation
-
-Each input point will be represented as a record such as:
-
-```text
-(point_id, coordinates)
-```
-
-During processing, additional metadata will be attached:
-
-```text
-(point_id, coordinates, primary_partition, replica_partition, flag)
-```
-
-and later:
-
-```text
-(point_id, coordinates, partition_id, local_cluster_id, point_type)
-```
-
-Unique point IDs are important because the same point may appear in multiple partitions due to replication.
-
-### 4.3 Spark Pipeline
-
-The implementation is planned as the following Spark pipeline:
-
-#### Step 1: Load data
-
-- Read a synthetic or real dataset into an RDD/DataFrame.
-- Assign each point a unique ID.
-
-#### Step 2: Compute partition assignment
-
-- Use a spatial partitioning function to map each point to a grid cell.
-- Determine whether the point needs replication to neighboring cells.
-
-Possible Spark operation:
-
-- `flatMap(point -> [(cell_id, point_with_metadata), ...])`
-
-#### Step 3: Group by partition
-
-- Group all records belonging to the same partition.
-
-Possible Spark operation:
-
-- `groupByKey()` or a more efficient alternative depending on structure.
-
-#### Step 4: Local DBSCAN
-
-- For each partition, run a custom local DBSCAN implementation.
-- Produce local cluster labels.
-
-Possible Spark operation:
-
-- `mapValues(local_dbscan)` or `mapPartitions(...)`
-
-#### Step 5: Extract merge candidates
-
-- Identify cases where the same original point or neighboring boundary points connect different local clusters.
-- Emit cluster-pair merge relations.
-
-Possible Spark operation:
-
-- `flatMap(...)` to output `(local_cluster_A, local_cluster_B)` pairs.
-
-#### Step 6: Compute global cluster merging
-
-- Apply Union-Find logic or iterative connected-component merging.
-- Create a mapping from local cluster IDs to final global cluster IDs.
-
-#### Step 7: Produce final labels
-
-- Join point-level local labels with the global merge mapping.
-- Remove duplicate replicated records and keep only original points in the final output.
-
-------
-
-### 4.4 Local DBSCAN Module
-
-The local DBSCAN module will be manually implemented and not replaced by an external clustering library, in compliance with the project requirement.
-
-This module will:
-
-- compute pairwise neighborhood relations inside one partition,
-- determine core/border/noise points,
-- expand local clusters using BFS/queue-based traversal,
-- return a label for each point in the partition.
-
-For simplicity and transparency, the initial version may use direct distance computation within a partition. If time permits, partition-local optimizations may be explored.
-
-### 4.5 Partitioning Design
-
-The initial implementation will use a **uniform grid partitioning** strategy because:
-
-- it is easy to explain,
-- easy to implement,
-- and closely aligned with the geometry of radius-based neighborhood queries.
-
-The grid size will be chosen in relation to `eps`. A natural starting idea is to make cell width comparable to `eps`, so that only a limited number of neighboring cells need to be considered for replication.
-
-This design may later be discussed or improved in terms of:
-
-- partition skew,
-- replication rate,
-- sensitivity to data distribution.
-
-### 4.6 Cluster Merging Design
-
-The merging module will treat each local cluster as a temporary identifier. Merge candidates will be generated from partition boundary evidence.
-
-A simple design is:
-
-- represent each local cluster as a node,
-- build edges between local clusters that share replicated points or satisfy cross-boundary connectivity,
-- compute final connected components.
-
-This can be implemented either:
-
-- partly in Spark,
-- or by collecting only the compact merge graph to the driver if its size is manageable.
-
-For a course project, this is a reasonable engineering trade-off because the merge graph is usually much smaller than the full dataset.
-
-### 4.7 Experimental Plan
-
-The project will evaluate the implementation from both **correctness** and **scalability** perspectives.
-
-#### Correctness evaluation
-
-- compare results on small datasets with a sequential DBSCAN implementation;
-- verify cluster assignments visually on 2D synthetic datasets if applicable;
-- check whether boundary-crossing clusters are correctly merged.
-
-#### Scalability evaluation
-
-The course explicitly requires experiments demonstrating scalability with increasing data size and number of executors in the final presentation/report.
-Therefore, the following experiments are planned:
-
-1. **Varying dataset size**
-   - e.g. 10K, 50K, 100K, 500K points
-2. **Varying number of workers / local cores**
-   - e.g. `local[1]`, `local[2]`, `local[4]`, `local[*]`
-3. **Possibly varying partition granularity**
-   - to study the effect of partition count and replication overhead
-
-Metrics to report:
-
-- total runtime,
-- runtime of major stages,
-- speedup,
-- replication overhead,
-- number of merge operations.
-
-### 4.8 Possible Optimizations
-
-If time permits, the project may include one or more optimizations:
-
-- improved partition sizing,
-- using `mapPartitions` instead of less efficient grouping patterns,
-- caching intermediate RDDs,
-- pruning unnecessary replication,
-- more efficient local neighborhood search.
-
-These optimizations will be discussed in the presentation/report as potential improvements, which is also encouraged by the project specification.
-
-------
-
-## 5. Expected Contributions
-
-This project is expected to contribute:
-
-1. A complete manual implementation of distributed DBSCAN in Spark;
-2. A clear demonstration of how a density-based clustering algorithm can be adapted to a distributed environment;
-3. An analysis of the trade-offs among correctness, replication cost, and scalability;
-4. Experimental evidence on how the implementation behaves with larger data and more parallelism.
+本项目旨在**挑战从零开始在 PySpark 中实现分布式的 HDBSCAN 算法**。由于 HDBSCAN 包含全局 KNN 和图论（MST）的计算，它比普通的分布式 DBSCAN 更具挑战性。通过“局部 MST 边压缩”与“全局树合并”的创新策略，本项目将展示如何将一个高度依赖全局图结构的复杂算法转化为高效的分布式 MapReduce 计算流，深度契合本课程“深入理解分布式计算原理”的要求。
 
 ---
 
-## 6. Conclusion
+## 3. HDBSCAN 算法核心概念介绍
 
-This project proposes a distributed implementation of DBSCAN using Apache Spark. The key idea is to decompose the algorithm into:
+在设计分布式版本之前，单机 HDBSCAN 的核心步骤如下：
 
-- spatial partitioning,
-- independent local clustering,
-- and global merging of boundary-connected local clusters.
+1. **核心距离 (Core Distance)**：对于每个点 $x$，定义 $core\_dist(x)$ 为它到第 $k$ 个最近邻点的距离（$k$ 即 `min_samples` 参数）。
+2. **互达距离 (Mutual Reachability Distance, MRD)**：为了让稀疏区域的点远离，定义点 $a$ 和 $b$ 的互达距离为：
+   $$MRD(a, b) = \max \{core\_dist(a), core\_dist(b), dist(a, b)\}$$
+3. **构建最小生成树 (MST)**：将数据集视为一个完全图，顶点是数据点，边的权重是它们之间的 MRD。使用 Prim 或 Kruskal 算法构建这棵图的最小生成树。
+4. **构建层次聚类树 (Single Linkage)**：将 MST 按边权重从大到小依次移除，连通分量不断分裂，形成一棵树。
+5. **凝缩树与提取簇 (Tree Condensation & Extraction)**：计算每个簇在不同密度阈值下的“生命周期”（Stability），选择最稳定的连通分量作为最终的簇，其余散落的点即为噪声。
 
-The project is meaningful because DBSCAN is an important clustering algorithm whose density-based nature makes distributed implementation non-trivial. By implementing it manually in Spark, the project will demonstrate both algorithmic understanding and distributed systems thinking, which matches the main goal of the deep project assignment.
+---
+
+## 4. 分布式架构设计思路 (Distributed Design & Architecture)
+
+分布式 HDBSCAN 的最大痛点是**全局 KNN 搜索**和**完全图上的 MST 构建**（边数高达 $O(N^2)$）。为此，本项目设计了以下 **四阶段 (4-Phase) 启发式分布式架构**，核心创新点在于利用局部 MST 大幅压缩图的边数。
+
+### Phase 1: 空间划分与边界软截断 (Spatial Partitioning & Soft Boundary)
+- **空间分区**：摒弃简单的网格划分，采用更均衡的 **KD-Tree** 或 **Quad-Tree** 启发式划分，将高维空间切分为多个互不相交的区域（Partition），分配给不同的 Spark Worker。
+- **边界复制 (Ghost Points)**：由于 HDBSCAN 没有绝对的 `eps`，我们引入一个合理的超参数 `max_dist`（基于样本抽样估计）。如果一个点距离分区边界小于 `max_dist`，则将其复制到相邻分区。距离超过 `max_dist` 的点对在实际中几乎总是在建树时被当作噪声边砍掉，这种启发式截断是分布式图计算的关键。
+
+### Phase 2: 局部核心距离与局部 MST 构建 (Local MST Construction)
+在每个 Partition 内部并行执行（完全解耦）：
+- **局部 KNN**：计算每个点在该分区内（包含边界复制点）的 `min_samples` 近邻，得到 `core_dist`。
+- **计算 MRD 与 局部 MST**：在分区内部计算点对的 MRD。**核心创新**：每个分区内部独立运行 Kruskal 算法构建 **局部最小生成树 (Local MST)**。
+- **降维打击**：原本一个包含 $M$ 个点的分区，有 $O(M^2)$ 条边；构建局部 MST 后，边数被极致压缩为 $M - 1$ 条。这使得后续的网络传输成为可能。
+
+### Phase 3: 跨分区边提取与全局 MST 合并 (Global MST Merging)
+- **跨区连通**：提取跨越分区的边界点对（Primary Point 与 Ghost Point 之间）的 MRD，形成边界边集合。
+- **全局合并**：将所有分区生成的 **Local MST 边** 和 **跨区边界边** 汇聚。由于边数已经被压缩到了 $O(N)$ 级别，我们可以将这些边 `collect` 到 Driver 端，运行一次轻量级的全局 Kruskal 算法，得到最终的 **全局最小生成树 (Global MST)**。
+
+### Phase 4: 树凝缩与簇提取 (Tree Condensation & Cluster Extraction)
+在 Driver 端拿到全局 MST 后：
+- 按边权重降序移除边，模拟层次分裂过程。
+- 计算每个节点的 Stability，按照 HDBSCAN 的规则提取最终的稳定簇。
+- 将最终的聚类标签（Cluster ID 或 Noise）广播（Broadcast）回各个 Worker，完成 RDD 的最终标记。
+
+---
+
+## 5. 核心伪代码 (Pseudocode)
+
+```text
+Input: Dataset RDD D, min_samples k, max_dist
+Output: RDD with Point_ID and Cluster_Label
+
+// Phase 1: Spatial Partitioning
+1. partitions = build_spatial_tree(D.sample(fraction))
+2. partitioned_RDD = D.flatMap(point -> assign_to_partitions_with_ghosts(point, partitions, max_dist))
+
+// Phase 2: Local Core Distance & Local MST (Parallel Execution)
+3. local_edges_RDD = partitioned_RDD.groupByKey(partition_id).flatMap(partition_data -> {
+4.     local_points, ghost_points = split(partition_data)
+5.     
+6.     // Calculate Core Distances locally
+7.     for p in local_points:
+8.         p.core_dist = distance_to_kth_neighbor(p, local_points + ghost_points, k)
+9.         
+10.    // Calculate MRD and Build Local MST
+11.    local_graph_edges = calculate_MRD(local_points)
+12.    local_mst = kruskal_mst(local_graph_edges)
+13.    
+14.    // Extract boundary edges crossing partitions
+15.    cross_edges = calculate_MRD_between(local_points, ghost_points)
+16.    
+17.    return local_mst U cross_edges
+18. })
+
+// Phase 3: Global MST Merging
+19. all_candidate_edges = local_edges_RDD.collect() // Number of edges is now O(N)
+20. global_mst = kruskal_mst(all_candidate_edges)
+
+// Phase 4: Cluster Extraction
+21. hierarchy_tree = build_single_linkage_tree(global_mst)
+22. cluster_labels_map = extract_stable_clusters(hierarchy_tree)
+23. broadcast_labels = sc.broadcast(cluster_labels_map)
+
+// Finalize
+24. result_RDD = D.map(point -> (point.id, broadcast_labels.value.get(point.id, "NOISE")))
+```
+
+---
+
+## 6. 实验设计与结果分析规划 (Experimental Design)
+
+本项目的实验将重点验证算法的**正确性（能否处理变密度集群）**和**分布式架构的可扩展性（Scalability）**。
+
+### 6.1 对照组实验：正确性与优越性验证 (Correctness & Superiority)
+- **数据集设计**：人工生成包含明显密度差异的二维/三维数据集（例如：密集的内环圈与稀疏的外环圈、距离很近但密度完全不同的高斯分布斑块）。
+- **对照算法设置**：
+  1. **单机版 KMeans**：作为 Baseline，证明基于距离的算法无法处理非凸形状。
+  2. **分布式基础版 DBSCAN**（设置固定的 `eps`）：证明单一 `eps` 无法同时兼顾密集簇和稀疏簇（要么稀疏簇被当成噪声，要么密集簇连成一片）。
+  3. **本项目实现的分布式 HDBSCAN**。
+- **预期结果分析**：通过可视化散点图（Scatter Plots），直观展示只有 HDBSCAN 能够完美提取出所有变密度和任意形状的簇，证明本算法在聚类质量上的绝对优越性。
+
+### 6.2 可扩展性实验 (Scalability)
+为了验证设计的局部 MST 压缩策略和 Spark 并行化的效率，设计以下实验：
+
+1. **数据规模扩展性测试 (Data Scalability)**：
+   - **设置**：固定 Spark Executor 数量（例如 4 个），使用合成数据集，规模分别设置为 $10万, 50万, 100万, 500万$ 个数据点。
+   - **指标**：记录算法总运行时间，以及各个 Phase（分区 Shuffle 耗时、局部 MST 计算耗时、全局合并耗时）的占比。
+   - **预期**：得益于局部 MST 将 $O(N^2)$ 的图计算降维，运行时间应呈现出可接受的近似线性或 $O(N \log N)$ 的增长曲线，而非指数级爆炸。
+
+2. **计算资源扩展性测试 (Strong Scaling)**：
+   - **设置**：固定数据集大小（例如 $100万$ 个点），逐步增加 Spark 集群的 Executor 数量（例如使用 `local[1]`, `local[2]`, `local[4]`, `local[8]` 模拟）。
+   - **指标**：绘制**加速比曲线 (Speedup Curve)**（$Speedup = T_{单机} / T_{集群}$）。
+   - **预期与分析**：前期随着核数增加，加速比接近线性上升；后期加速比可能放缓。我们将深入分析瓶颈来源（如网络 Shuffle 开销、`max_dist` 边界复制带来的冗余计算、Driver 端全局合并图的单点耗时），展现对分布式系统底层机制的深刻理解。
+
+---
+
+## 7. 潜在优化与总结 (Potential Improvements & Conclusion)
+
+### 潜在优化探讨
+在项目实施过程中或最终报告中，我们将讨论以下潜在改进方向：
+1. **彻底消除 Driver 瓶颈**：目前的 Phase 3 在 Driver 端进行全局合并，这对于几百万条边是可行的。若面对数亿级数据，可考虑实现分布式的 Borůvka 算法，将全局连通图合并操作完全下推到 RDD 的 Reduce 阶段。
+2. **`max_dist` 的自适应截断**：进一步探索如何通过初步的数据采样，动态且自动地为每个空间分区推断一个安全的 `max_dist`，减少不必要的 Ghost Points 复制网络开销。
+
+### 总结
+本项目提出并实现了一个基于 Apache Spark 的分布式 HDBSCAN 算法。通过“空间分区 -> 局部 MST 边压缩 -> 全局图合并 -> 层次树提取”的流水线架构，巧妙地解决了 HDBSCAN 算法中全局 KNN 搜索和完全图构建带来的灾难性计算负担。本项目不仅深入贯彻了分布式的底层实现逻辑（全手动实现内部机制，不依赖第三方 ML 库的黑盒方法），同时在算法复杂度和并行化创新上具有极高的深度，是一次兼顾理论先进性与系统工程挑战的深度实践。
